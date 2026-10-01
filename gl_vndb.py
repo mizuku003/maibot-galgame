@@ -138,7 +138,7 @@ class VndbClient:
     ) -> dict[str, Any]:
         """按条件筛选，保留 ``more`` / ``count`` 这些分页元信息。
 
-        和 :meth:`query` 的区别是它把游标信息一起带回来 —— 「按评分找作品」
+        和别处只取结果的查法不同：它把游标信息一起带回来 —— 「按评分找作品」
         要能翻到中坚作品而不是永远停在榜首，就靠这个。
 
         Args:
@@ -207,16 +207,6 @@ class VndbClient:
             limit=max(1, min(int(limit), 100)),
         )
         return list(page.get("results") or [])
-
-    async def query(
-        reverse: bool = True,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """按条件筛选（只要结果列表的老接口）。"""
-        page = await self.query_page(
-            filters=filters, sort=sort, reverse=reverse, limit=limit
-        )
-        return page["results"]
 
     async def tag_id(self, name: str) -> str | None:
         """标签名 → 标签 id（g833 这种）。
