@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "mizuku003.galgame",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "name": "galgame领域大神",
   "description": "多源 galgame 资料查询：中文名与汉化、通关时长与标签、评分与玩家锐评，支持别名检索、条件推荐、资料卡出图与 /锐评；附带 gal 圈情报与贴吧话术学习。",
   "author": {
@@ -52,9 +52,10 @@
   "plugin_type": "tool",
   "display": {
     "icon": {
-      "type": "lucide",
-      "value": "gamepad-2",
-      "fallback": "gamepad"
+      "type": "local",
+      "value": "assets/icon.png",
+      "fallback": "gamepad-2",
+      "background": "#0d1323"
     }
   }
 }
