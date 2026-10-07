@@ -458,7 +458,12 @@ def _parse_shorthand(token: str) -> dict[str, Any] | None:
     elif lowered[-1:] == "h" and re.fullmatch(r"\d+(?:\.\d+)?", core[:-1]):
         dim, core = "hours", core[:-1]
     elif lowered[:1] == "t" and len(core) > 1:
-        return {"tags": [t.strip() for t in core[1:].split(",") if t.strip()]}
+        # 「t + 标签」是用法卡上写着的写法（/gal v80+ tSLG y2015）。但只看首字母的话，
+        # 「/gal tsukihime」这种以 t 开头的作品名会被整词当成标签吃掉（query 变空、静默搜不到）。
+        # 所以要求标签部分**看起来像标签**：含逗号、或含大写字母 / 非 ASCII 字符。
+        _tag_part = core[1:]
+        if "," in _tag_part or any(ch.isupper() or ord(ch) > 127 for ch in _tag_part):
+            return {"tags": [t.strip() for t in _tag_part.split(",") if t.strip()]}
     elif lowered[:1] == "y" and core[1:].isdigit():
         return {"year": int(core[1:])}
     elif lowered[:1] == "n" and core[1:].isdigit():
@@ -570,7 +575,7 @@ from maibot_sdk import Command, MaiBotPlugin, Tool  # noqa: E402
 from gl_config import DEFAULT_REVIEW_PROMPT, GalgameConfig  # noqa: E402
 from gl_egs import EgsClient  # noqa: E402
 from gl_http import HttpClient, similarity  # noqa: E402
-from gl_merge import GalgameService, GameInfo  # noqa: E402
+from gl_merge import MAX_OFFSET, GalgameService, GameInfo  # noqa: E402
 from gl_render import (  # noqa: E402
     NEWS_SOURCE_LABELS as NEWS_LABELS,
     build_info_html,
@@ -592,6 +597,15 @@ class GalgamePlugin(MaiBotPlugin):
     # -- 生命周期 ---------------------------------------------------------
 
     async def on_load(self) -> None:
+        # 宿主在 on_load 失败时**不会**调 on_unload（runner_main 直接 unregister），
+        # 已经建好的 http 客户端就永远没人关了；这里兜一层，先把客户端收掉再往外抛。
+        try:
+            await self._on_load_inner()
+        except Exception:
+            await self._close_http()
+            raise
+
+    async def _on_load_inner(self) -> None:
         self._http: HttpClient | None = None
         self._egs_http: HttpClient | None = None
         self._service: GalgameService | None = None
@@ -600,6 +614,9 @@ class GalgamePlugin(MaiBotPlugin):
         self._style_ledger: gl_style.StyleLedger | None = None
         self._style_task: asyncio.Task | None = None
         self._style_sync_task: asyncio.Task | None = None
+        # 后台循环与「/gal 话术 刷新」可能同时开跑：都走「查宿主现状 → 再插行」，
+        # 重叠时会重复插行、重复抓贴吧。用这把锁串起来。
+        self._style_learn_lock = asyncio.Lock()
         # 最近一次「新闻/预定/情报」列出的条目，供 /gal 详情 <序号> 回查：
         # {stream_id: (时间戳, [条目…])}。只活在内存里，重启就没了（列表随时能再列一次）。
         self._intel_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
@@ -642,6 +659,10 @@ class GalgamePlugin(MaiBotPlugin):
         await self._cancel_style_task()
         await self._cancel_style_sync()
         await self._close_http()
+        # 配置一改，上一屏的序号记忆可能指向旧数据源；机器人昵称也要重新读一次
+        self._intel_cache.clear()
+        global _bot_nickname_cache
+        _bot_nickname_cache = None
         self._setup()
         self._maybe_build_index()
         self._style_ledger = gl_style.StyleLedger(self._data_dir() / "style_ledger.json")
@@ -952,6 +973,15 @@ class GalgamePlugin(MaiBotPlugin):
         # count 留空（0）时用配置里的默认条数，这样配置项才真的有效
         count = max(1, min(int(count or 0) or int(cfg.recommend.default_count), 10))
         offset = max(0, int(offset or 0))
+        if offset >= MAX_OFFSET:
+            return {
+                "success": False,
+                "error": (
+                    f"已经翻到底了：同一组条件最多只能往后翻到第 {MAX_OFFSET} 条"
+                    "（翻页要重新补全前面的候选，越深越慢）。"
+                    "想看更多请换一组条件，或把 offset 调小回到前面几页。"
+                ),
+            }
         has_filter = any(
             [min_egs, max_egs, min_rating, max_rating, min_votes, min_hours, max_hours, tags, year_from, offset]
         )
@@ -1103,7 +1133,13 @@ class GalgamePlugin(MaiBotPlugin):
         # 结果刚好装满一页，说明后面很可能还有 —— 明确告诉模型「怎么要下一批」，
         # 否则它只会反复用同样的条件重问，用户看到的永远是同一批作品
         if len(picks) >= count:
-            note += f"\n（要往后看就说「再来几部」，用同样的条件加 offset={offset + count}）"
+            if offset + count < MAX_OFFSET:
+                note += f"\n（要往后看就说「再来几部」，用同样的条件加 offset={offset + count}）"
+            else:
+                note += (
+                    "\n（这已经是能翻到的最后一页了，再往后没有更多；"
+                    "换组条件或把 offset 调小回前面看）"
+                )
         return {
             "success": True,
             "content": f"按「{condition}」找到：\n" + "\n".join(lines) + note,
@@ -1173,9 +1209,13 @@ class GalgamePlugin(MaiBotPlugin):
 
     async def _tool_detail(self, stream_id: str, index: int) -> dict[str, Any]:
         """看上一次列出的第 N 条的详情（和 /gal 详情 <序号> 共用一份记忆）。"""
-        if not int(index):
+        try:
+            number = int(str(index).strip())
+        except (TypeError, ValueError):
+            number = 0
+        if number <= 0:
             return {"success": True, "content": "要看第几条？把序号一起给我（1 开始）。"}
-        item = self._recall_intel(stream_id, int(index))
+        item = self._recall_intel(stream_id, number)
         if item is None:
             return {
                 "success": True,
@@ -1374,7 +1414,7 @@ class GalgamePlugin(MaiBotPlugin):
                 await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
                 return True, "维护命令需要管理员权限", 1
         # random / new 的数字参数从 rest 里取；没给就交给各自的默认值
-        number = int(rest) if rest.isdigit() else 0
+        number = int(rest) if (rest.isascii() and rest.isdigit()) else 0
 
         # 命令词只认用法卡（`/gal help`）上写的那几个，外加卡片上明说的两种写法
         # （`/gal new` ≙ `/gal 新作`、`/gal 3` ≙ `/gal 详情 3`）。
@@ -1409,7 +1449,7 @@ class GalgamePlugin(MaiBotPlugin):
             return await self._cmd_style(stream_id, rest)
         # 纯数字且刚列过一屏 → 当成「看第 N 条的详情」（/gal 3）。放在筛选之前，
         # 但只有记忆里真有第 N 条才走，否则照旧交给筛选（数字也可能是别的条件）。
-        if low.isdigit() and self._recall_intel(stream_id, int(low)) is not None:
+        if low.isascii() and low.isdigit() and self._recall_intel(stream_id, int(low)) is not None:
             return await self._cmd_detail(stream_id, low)
         # **其余一律当筛选条件**（`/gal 85+ 10h`、`/gal egs>=85` 都走这条）。
         # 曾经这里去猜「看起来像不像条件」（比如判断有没有 =<>），结果 `/gal 90+`
@@ -1676,6 +1716,8 @@ class GalgamePlugin(MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 await self.ctx.send.text(f"增量更新失败：{exc}", stream_id, storage_message=False)
 
+        # 可能已经有一个自动增量任务在跑；引用被覆盖后旧任务就没人能取消（on_unload 只取消最后一个）
+        await self._cancel_index_task()
         self._index_task = asyncio.create_task(_job())
         return True, "已开始", 1
 
@@ -1708,6 +1750,7 @@ class GalgamePlugin(MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 await self.ctx.send.text(f"索引建失败：{exc}", stream_id, storage_message=False)
 
+        await self._cancel_index_task()
         self._index_task = asyncio.create_task(_job())
         return True, "已开始", 1
 
@@ -1727,6 +1770,8 @@ class GalgamePlugin(MaiBotPlugin):
             + ("　有汉化" if it.get("have_chinese") else "")
             for it in items
         ]
+        # 和情报 / 预定 / 新作一样记一屏：不然紧接着的「/gal 详情 3」必然找不到
+        self._remember_intel(stream_id, items)
         await self._send_release_card(
             stream_id,
             items,
@@ -1859,7 +1904,13 @@ class GalgamePlugin(MaiBotPlugin):
                 gl_news.apply_translations(items, titles)
             # 用户反馈「说有翻译，结果还是日语原文」—— 到底翻了几条必须留痕，
             # 否则翻译整批失败（模型超时/返回格式变了）时只能靠猜。
-            got = sum(1 for item in items if item.get("title_zh"))
+            # 只数日文条目：月幕的中文条目天生就有 title_zh，把它算进来会让下面
+            # 「一条都没翻出来」的告警永远不触发（诊断失真）。
+            got = sum(
+                1
+                for item in items
+                if str(item.get("lang") or "") == "ja" and item.get("title_zh")
+            )
             want = sum(1 for item in items if str(item.get("lang") or "") == "ja")
             self.ctx.logger.info("[Galgame/情报] 新闻标题翻译：%d 条译文 / %d 条待翻", got, want)
             if want and not got:
@@ -1981,6 +2032,14 @@ class GalgamePlugin(MaiBotPlugin):
         query = str(params.get("query") or "")
         count = max(1, min(int(params.get("count") or 0) or int(cfg.recommend.default_count), 10))
         offset = max(0, int(params.get("offset") or 0))
+        if offset >= MAX_OFFSET:
+            await self.ctx.send.text(
+                f"已经翻到底了：同一组条件最多只能翻到第 {MAX_OFFSET} 条，"
+                "再往后没有更多作品；把 offset 调小，或换组条件。",
+                stream_id,
+                storage_message=False,
+            )
+            return False, "翻页到底", 1
         min_egs = float(params.get("min_egs") or 0)
         max_egs = float(params.get("max_egs") or 0)
         min_rating = float(params.get("min_rating") or 0)
@@ -2125,7 +2184,7 @@ class GalgamePlugin(MaiBotPlugin):
         批评空间有**专门的按年份排行页**，和全局榜单是两份数据（列数都不同）。
         直接问「那一年的高分作」比拿发售日再本地过滤更准。
         """
-        year = int(rest.strip()) if rest.strip().isdigit() else 0
+        year = int(rest.strip()) if (rest.strip().isascii() and rest.strip().isdigit()) else 0
         if not 1990 <= year <= 2100:
             await self.ctx.send.text(
                 "用法：/gal 年份 2015（查看该年的中央值排行）",
@@ -2517,7 +2576,7 @@ class GalgamePlugin(MaiBotPlugin):
         try:
             return await gl_news.fetch_article(self._http, url, limit=limit)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[Galgame/情报] 详情抓原文失败：%s", exc)
+            self.ctx.logger.warning("[Galgame/情报] 详情抓原文失败：%s", exc)
             return ""
 
     async def _translate_detail(self, body: str) -> str:
@@ -2536,7 +2595,7 @@ class GalgamePlugin(MaiBotPlugin):
             try:
                 zh = await gl_news.translate_text(chunk, self._generate_text, limit=0)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[Galgame/情报] 详情正文翻译失败（保留原文）：%s", exc)
+                self.ctx.logger.warning("[Galgame/情报] 详情正文翻译失败（保留原文）：%s", exc)
                 zh = ""
             parts.append(zh.strip() if zh else chunk)
         return "\n\n".join(part for part in parts if part)
@@ -2577,7 +2636,7 @@ class GalgamePlugin(MaiBotPlugin):
         路径在图片模式和纯文本模式下都走得通。
         """
         text = str(raw or "").strip()
-        if not text.isdigit():
+        if not (text.isascii() and text.isdigit()):
             await self.ctx.send.text(
                 "用法：/gal 详情 <序号>，序号是刚列出的那一屏里的编号"
                 "（也可以直接打 /gal 3）。先 /gal 情报 或 /gal 预定 列一屏吧。",
@@ -2813,9 +2872,16 @@ class GalgamePlugin(MaiBotPlugin):
             ):
                 return
             try:
-                text = await self._run_style_learn()
-                if text:
-                    self.ctx.logger.info("[Galgame] 贴吧话术：%s", text.replace("\n", " | "))
+                if self._style_learn_lock.locked():
+                    # 手动 /gal 话术 刷新 正在跑，这一轮跳过，别重复抓贴吧
+                    text = ""
+                else:
+                    async with self._style_learn_lock:
+                        text = await self._run_style_learn()
+                        if text:
+                            self.ctx.logger.info(
+                                "[Galgame] 贴吧话术：%s", text.replace("\n", " | ")
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -2945,7 +3011,7 @@ class GalgamePlugin(MaiBotPlugin):
                 )
             else:
                 jg = {"created": 0, "skipped": 0}
-            ledger.save()
+            await asyncio.to_thread(ledger.save)
             head = f"{forum}吧："
             if dump.blocked:
                 # 「被拦住了」≠「这个吧是空的」。以前这两种情况打印出来一模一样，
@@ -2979,7 +3045,20 @@ class GalgamePlugin(MaiBotPlugin):
         parts = rest.split()
         word = parts[0].lower() if parts else "状态"
         if word == "刷新":
-            text = await self._run_style_learn([x for x in parts[1:] if x] or None)
+            if self._style_learn_lock.locked():
+                await self.ctx.send.text(
+                    "上一轮还在学，等它跑完再看（/gal 话术 状态 能看进度）。",
+                    stream_id,
+                    storage_message=False,
+                )
+                return True, "正在进行", 1
+            try:
+                async with self._style_learn_lock:
+                    text = await self._run_style_learn([x for x in parts[1:] if x] or None)
+            except Exception as exc:  # noqa: BLE001
+                # 以前这里没有兜底：一轮里任何一次异常都会让用户收不到任何回复
+                self.ctx.logger.warning("[Galgame] 手动刷新话术失败：%s", exc)
+                text = f"这一轮没跑成：{exc}"
             await self.ctx.send.text(text, stream_id, storage_message=False)
             return True, "话术学习完成", 1
         if word == "打标":
@@ -3262,6 +3341,10 @@ class GalgamePlugin(MaiBotPlugin):
             hints.append(
                 f"另外这次是从第 {offset + 1} 部开始取的，前面已经翻完了，"
                 f"可以换组条件或把 offset 调小"
+            )
+        if offset >= MAX_OFFSET:
+            hints.append(
+                f"同一组条件最多只能翻到第 {MAX_OFFSET} 条，到这儿就没有更多了"
             )
         return "".join(f"\n· {hint}" for hint in hints) or "把条件放宽点再试（降低评分下限、去掉标签或放宽时长）。"
 

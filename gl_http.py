@@ -166,9 +166,22 @@ class HttpClient:
                 return result
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                if attempt < self.retries:
+                if attempt < self.retries and _retryable(exc):
                     await asyncio.sleep(0.6 * (attempt + 1))
+                    continue
+                break
         raise HttpError(source, f"{type(last_error).__name__}: {last_error}") from last_error
+
+
+def _retryable(exc: Exception) -> bool:
+    """值得重试吗？只有限流（429）、服务端抖动（5xx）和网络异常值得。
+
+    400/404 这类是「请求本身有问题」，重试多少次都一样，只会白等退避时间。
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        code = exc.response.status_code
+        return code == 429 or code >= 500
+    return True
 
 
 # --- 文本工具（三源共用） -------------------------------------------------

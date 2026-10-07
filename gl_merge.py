@@ -34,6 +34,13 @@ LENGTH_BUCKETS = {
     5: (3000, 10**9),   # Very long   >50h
 }
 
+# 同一组条件最多能往后翻到第几条。翻页是把 offset 折进候选量、再整体去重富化，
+# 越深越慢（每部一次网络请求），所以给一个明确的天花板：到顶之后 find() 直接返回空，
+# 由调用方明确告诉用户「翻到底了」，而不是静默给一页空结果。
+MAX_OFFSET = 60
+# 候选池上限：比翻页上限多留 10 条，给「补完信息后被时长/年份/评分条件筛掉」的部分。
+_CANDIDATE_POOL = MAX_OFFSET + 10
+
 
 @dataclass
 class GameInfo:
@@ -184,9 +191,12 @@ class GalgameService:
         merged.sort(
             key=lambda g: (
                 max(
-                    similarity(keyword, x)
-                    for x in [g.title_zh, g.title_ja, g.title_main, g.title_en, *g.aliases[:5]]
-                    if x
+                    (
+                        similarity(keyword, x)
+                        for x in [g.title_zh, g.title_ja, g.title_main, g.title_en, *g.aliases[:5]]
+                        if x
+                    ),
+                    default=0.0,   # 名称全空的条目不该让整次搜索崩掉
                 ),
                 g.vndb_votes,
             ),
@@ -466,6 +476,10 @@ class GalgameService:
         「服务端档位粗筛 + 本地分钟精筛」两步走。
         """
         self.last_warnings = []
+        # offset 是「第几页 × 每页条数」。候选池有上限，越界时不可能再翻出一页 ——
+        # 早点返回空，让调用方给出「已到翻页上限」的提示。
+        if offset >= MAX_OFFSET:
+            return []
         tags = list(tags or [])
         want_minutes = length_max_minutes > 0 or length_min_minutes > 0
         want_egs = min_egs > 0 or max_egs > 0
@@ -701,7 +715,7 @@ class GalgameService:
         # 翻页不在这里做 —— find() 传进来的 count 已经含了 offset，切片统一放最后一步。
         # 这里的上限是关键：富化是每部一次网络请求，取太多会直接把响应时间拖到十几秒，
         # 所以只留 10 条余量，而不是按倍数放大。
-        take = min(count + 10, 45)
+        take = min(count + 10, _CANDIDATE_POOL)
         shortlist = candidates[:take]
 
         picked: list[GameInfo] = [self._row_to_info(item) for item in shortlist]
@@ -864,7 +878,7 @@ class GalgameService:
             if length_min_minutes > 0 and minutes and minutes < length_min_minutes:
                 continue
             picked.append(self._build_info(raw, None))
-            if len(picked) >= min(count + 10, 45):
+            if len(picked) >= min(count + 10, _CANDIDATE_POOL):
                 break
 
         # 挂批评空间分数（本地索引，零开销），并补汉化状态
@@ -879,7 +893,7 @@ class GalgameService:
             picked = [g for g in picked if g.egs_id and g.egs_id in allow_ids]
         # 富化的条数就是响应时间 —— 每部一次月幕请求，翻页时别跟着 count 线性涨，
         # 只多留 10 条余量给「时长/评分条件筛掉一部分」。
-        enrich_n = min(count + 10, 45)
+        enrich_n = min(count + 10, _CANDIDATE_POOL)
         # 限并发：无上限地并发打月幕会被限流，反而补不齐
         enrich_sem = asyncio.Semaphore(4)
 

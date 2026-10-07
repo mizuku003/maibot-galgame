@@ -59,7 +59,15 @@ _WS_RE = re.compile(r"\s+")
 _IMG_SRC_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.I)
 # bugbug 每条 description 尾巴都挂版权，形状是 "Copyright &copy; 2026    All Rights Reserved."；
 # 注意 strip_html 会先把实体反转义成 ©，所以两种写法都要认。
-_COPYRIGHT_RE = re.compile(r"Copyright\s*(?:&copy;|©)?\s*\d{0,4}.*?(?:All Rights Reserved\.?|$)", re.I | re.S)
+#
+# 只删这两种**定形**的写法。以前多了个「或者到字符串结尾」的分支：正文里任何一处出现
+# Copyright，就会从那儿一路删到文末（段落中段有这个词，后半段就没了）。
+# 宁可留下一个版权尾巴，也不能吞正文。
+_COPYRIGHT_RE = re.compile(
+    r"Copyright\s*(?:&copy;|©)?\s*\d{0,4}[^\n]{0,120}?All Rights Reserved\.?"
+    r"|Copyright\s*(?:&copy;|©)?\s*\d{0,4}\s*\Z",
+    re.I,
+)
 _TITLE_QUOTE_RE = re.compile(r"""["']([^"']{1,200})["']""")
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.I | re.S)
 # 「1. 中文」「1、中文」「- 中文」「1) 中文」这类逐行写法
@@ -120,7 +128,9 @@ def parse_pubdate(text: Any) -> str:
         return ""
     try:
         dt = parsedate_to_datetime(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # 超长年份会抛 OverflowError（不是 ValueError）；漏了它整个源的 RSS 都会丢，
+        # 因为 parse_feed 只捕 ET.ParseError，异常会一路冒到 collect_news。
         return ""
     if dt is None:
         return ""
@@ -604,7 +614,11 @@ async def translate_indexes(
     batch: int = 20,
 ) -> list[str]:
     """按给定下标批量翻标题，返回与 indexes 等长的中文表（翻不动的位置给空串）。"""
-    titles = [str(items[i].get("title") or "") for i in indexes if 0 <= i < len(items)]
+    # 返回长度必须与 indexes 等长（调用方拿它跟下标 zip）：越界位置给空串占位，
+    # 而不是把它们从列表里挤掉、让后面的译文整体错位。
+    titles = [
+        str(items[i].get("title") or "") if 0 <= i < len(items) else "" for i in indexes
+    ]
     if not titles or generate is None:
         return [""] * len(titles)
     out: list[str] = []
@@ -724,6 +738,14 @@ def apply_translations(items: list[dict[str, Any]], titles: list[str]) -> int:
 # --- 即将发售（月幕日历 + VNDB） ------------------------------------------
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """能转 int 就转，转不了给默认值（数据源偶尔给 null 或非数字）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _vndb_to_release(vn: dict[str, Any]) -> dict[str, Any]:
     """VNDB 条目 → 发售列表条目（键名与月幕的 _normalize_list_item 对齐）。"""
     developers = [str(x) for x in (vn.get("developers") or []) if str(x).strip()]
@@ -738,7 +760,8 @@ def _vndb_to_release(vn: dict[str, Any]) -> dict[str, Any]:
         "restricted": None,
         "developer": developers[0] if developers else "",
         "rating": vn.get("rating"),
-        "votecount": int(vn.get("votecount") or 0),
+        # 以前直接 int()：votecount 是 null / 字符串时整批「新作」都会失败
+        "votecount": _safe_int(vn.get("votecount")),
         "vndb_id": str(vn.get("id") or ""),
     }
 

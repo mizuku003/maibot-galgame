@@ -370,11 +370,17 @@ class YmgalClient:
             cid = str((rel or {}).get("cid") or "")
             cv_id = str((rel or {}).get("cvId") or "")
             cv = (pid_mapping.get(cv_id) or {}).get("name") if cv_id else ""
+            # characterPosition 实测出现过 'unknown' 这种非数字，直接 int() 会让整条查询失败
+            _pos_raw = (rel or {}).get("characterPosition")
+            try:
+                _pos = int(_pos_raw)
+            except (TypeError, ValueError):
+                _pos = 2
             characters.append(
                 {
                     "cid": cid,
                     "cv": str(cv or ""),
-                    "position": int((rel or {}).get("characterPosition") or 2),
+                    "position": _pos,
                 }
             )
 
@@ -417,7 +423,11 @@ class YmgalClient:
             "cover": _absolute_image(game.get("mainImg")),
             "intro": str(game.get("introduction") or ""),
             "have_chinese": bool(game.get("haveChinese")),
-            "restricted": bool(game.get("restricted")),
+            # 字段缺失 =「未知」，不能当成「全年龄」：列表接口就是这么写的，
+            # 详情这里写死 bool() 会让 exclude_restricted 的过滤漏掉它。
+            "restricted": (
+                bool(game.get("restricted")) if game.get("restricted") is not None else None
+            ),
             "developer_id": str(game.get("developerId") or ""),
             "type_desc": str(game.get("typeDesc") or ""),
             "characters": characters,

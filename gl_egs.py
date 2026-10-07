@@ -497,7 +497,11 @@ class EgsClient:
         return stats
 
     async def _page_lowest_median(self, offset: int) -> int | None:
-        """取某页的**最低**中央值；空页返回 None。二分定位全靠它。"""
+        """取某页的**最低**中央值。二分定位全靠它。
+
+        抓取失败返回 None —— 调用方必须**中止**二分，不能当成「这一页分数低」；
+        页面取到了但一条作品都没有（翻过榜单末尾）返回 -1（确实比任何阈值都低）。
+        """
         body = await self._fetch_ranking_page(offset)
         if body is None:
             return None
@@ -506,10 +510,13 @@ class EgsClient:
             for r in self._parse_ranking_rows(body)
             if r.get("median")
         ]
-        return min(medians) if medians else None
+        return min(medians) if medians else -1
 
-    async def boundary_offset(self, threshold: int, *, max_offset: int = 40000) -> int:
-        """二分找出**最小的**那个 offset，使该页的最低中央值 < ``threshold``。
+    async def boundary_offset(self, threshold: int, *, max_offset: int = 40000) -> int | None:
+        """二分找出**最小的**那个 offset，使该页的最低中央值 < 阈值。
+
+        取不到页面（超时 / 反爬 / 空 body）时返回 None：宁可让上层降级成 VNDB 分近似，
+        也不能把「抓取失败」当成「这一页分数低」——那会把边界越推越偏，筛出来的区间是错的。
 
         也就是「中央值高于 threshold 的区段」到此为止。
         榜单降序，本该能按分数随机访问 —— 没有升序参数也无所谓，**二分就够了**：
@@ -519,7 +526,12 @@ class EgsClient:
         while lo < hi:
             mid = ((lo + hi) // 2) // 100 * 100
             lowest = await self._page_lowest_median(mid)
-            if lowest is None or lowest < threshold:
+            if lowest is None:
+                logger.warning(
+                    "[EGS] 二分定位时这一页取不到（offset=%s），放弃二分改用降级路径", mid
+                )
+                return None
+            if lowest < threshold:
                 hi = mid
             else:
                 lo = mid + 100
@@ -540,9 +552,15 @@ class EgsClient:
         - 都不给 → 从榜单开头翻。
         """
         if max_egs > 0:
-            start = await self.boundary_offset(int(max_egs) + 1)
+            boundary = await self.boundary_offset(int(max_egs) + 1)
+            if boundary is None:
+                return []          # 定位失败 → 上层降级成 VNDB 分近似
+            start = boundary
         elif min_egs > 0:
-            start = max(0, await self.boundary_offset(int(min_egs)) - max(1, pages) * 100)
+            boundary = await self.boundary_offset(int(min_egs))
+            if boundary is None:
+                return []
+            start = max(0, boundary - max(1, pages) * 100)
         else:
             start = 0
 
@@ -629,7 +647,7 @@ class EgsClient:
         try:
             body = await self._http.request(
                 "GET",
-                f"{BASE}/toukei_datacount.php?offset={max(0, offset)}&count=5",
+                f"{BASE}/toukei_datacount.php?offset={max(0, offset)}&count={self.min_votes}",
                 source="egs",
                 expect_json=False,
                 cache_ttl=1800.0,
@@ -677,11 +695,24 @@ class EgsClient:
                 re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", cell))).strip()
                 for cell in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, flags=re.S)
             ]
+            # 名字在「含 game.php 链接的那一格」。以前按「长度 > 1 且不是纯数字」猜，
+            # 标题只有一个字、或标题本身就是数字的作品会被静默丢掉。
             name = ""
-            for cell in cells:
-                if cell and len(cell) > 1 and not cell.isdigit():
-                    name = re.sub(r"\s*OHP\s*$", "", cell).strip()
+            for cell_html in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, flags=re.S):
+                if "game.php?game=" in cell_html:
+                    name = re.sub(
+                        r"\s*OHP\s*$",
+                        "",
+                        re.sub(
+                            r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", cell_html))
+                        ).strip(),
+                    ).strip()
                     break
+            if not name:
+                for cell in cells:
+                    if cell and not cell.isdigit():
+                        name = re.sub(r"\s*OHP\s*$", "", cell).strip()
+                        break
             if not name:
                 continue
             out.append({"id": link.group(1), "name": name, "att_id": 0})

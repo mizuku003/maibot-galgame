@@ -347,6 +347,7 @@ class TiebaClient:
             kwargs["proxy"] = proxy
         self._client = httpx.AsyncClient(**kwargs)
         self._seeded = False
+        self._seeded_ok = False      # 播种是否真的成功过：失败时的 403 = 缺 cookie，不是反爬
         self._seed_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
@@ -384,6 +385,7 @@ class TiebaClient:
                 await self._client.get(
                     BAIDU_HOME, headers={"User-Agent": MOBILE_UA, "Accept": "text/html,*/*"}
                 )
+                self._seeded_ok = True
             except Exception as exc:  # noqa: BLE001
                 # 播种失败也放行：有些网络环境下百度首页不可达但 tieba 本身可达
                 logger.debug("[Galgame/贴吧] 访客 cookie 播种失败（继续尝试）：%s", exc)
@@ -409,9 +411,17 @@ class TiebaClient:
         await self._seed_guest_cookie()
         merged = dict(headers or {})
         last: Exception | None = None
+        reseeded = False
         for attempt in range(self.retries + 1):
             try:
                 resp = await self._client.get(url, params=params, headers=merged)
+                # 访客 cookie 没拿到时贴吧对**任意**页面都回 403（它自己的 docstring 就这么写）。
+                # 这跟反爬拦截是两回事：先重新播种一次再重试，别直接判成封禁把整轮停掉。
+                if resp.status_code == 403 and not self._seeded_ok and not reseeded:
+                    reseeded = True
+                    self._seeded = False
+                    await self._seed_guest_cookie()
+                    raise httpx.HTTPError("HTTP 403（缺访客 cookie，已重新播种）")
                 if _looks_blocked(resp.status_code, resp.text):
                     self._mark_blocked()
                     logger.warning(
@@ -716,7 +726,10 @@ def parse_posts(
         if name_m:
             author = _text_of(name_m.group("name"))
         else:
-            author = _text_of(str(info.get("name_show", "")))
+            # name_show 可能是显式 null（.get 的默认值只对「没有这个 key」生效），
+            # str(None) 会写出一个 "None" 当作者名。
+            _name_raw = info.get("name_show")
+            author = _text_of(_name_raw) if isinstance(_name_raw, str) else ""
         time_m = _FLOOR_TIME_RE.search(body)
         try:
             floor = int(attrs.get("fn") or info.get("floor_num") or 0)

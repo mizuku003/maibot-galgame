@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from maibot_sdk import Field, PluginConfigBase
+from pydantic import model_validator
 
 
 class PluginSection(PluginConfigBase):
@@ -462,6 +463,20 @@ class StyleSection(PluginConfigBase):
         description="贴吧专用代理地址",
         json_schema_extra={"label": "（高级）贴吧专用代理", "hint": "留空跟随「数据源」代理；贴吧一般能直连"},
     )
+
+
+    @model_validator(mode="after")
+    def _check_reply_windows(self) -> "StyleSection":
+        """回复数 / 字数的下限不能大于上限。
+
+        两个字段各自都合法，合起来却会把每一层都过滤掉（结果永远显示「没学到东西」），
+        用户从面板上根本看不出是配置问题 —— 所以保存配置时就直说。
+        """
+        if self.min_replies > self.max_replies:
+            raise ValueError("回复数下限不能大于上限")
+        if self.reply_min_chars > self.reply_max_chars:
+            raise ValueError("回复最短字数不能大于最长字数")
+        return self
 
 
 class NewsSection(PluginConfigBase):

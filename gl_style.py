@@ -461,14 +461,19 @@ class StyleLedger:
         self._data["version"] = obj.get("version", _LEDGER_VERSION)
 
     def save(self) -> None:
+        self.prune_threads()      # 读过的帖子只留保鲜期内的，免得花名册无限长大
         self._data["version"] = _LEDGER_VERSION
         self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        tmp.replace(self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self.path)
+        except OSError as exc:
+            # 花名册只是缓存：写不进去最多下一轮重学，不该把整轮学习和后面的吧一起带走
+            logger.warning("[Galgame/话术] 花名册写盘失败（跳过，继续跑）：%s", exc)
 
     # -- 读 --
 
@@ -548,6 +553,10 @@ class StyleLedger:
         self._add("jargons", row)
 
     def forget(self, bucket: str, row_id: Any) -> None:
+        if row_id is None:
+            # 摘过 id 的条目本来就不在宿主表里；以前 row_id 是 None 时
+            # x.get("id") != None 会把**所有**没 id 的语料一起删掉（整批留档没了）。
+            return
         items = self._data.get(bucket) or []
         self._data[bucket] = [x for x in items if x.get("id") != row_id]
 
@@ -598,8 +607,13 @@ class StyleLedger:
         added = 0
         for tid in tids or ():
             key = str(tid or "").strip()
-            if key and key not in bucket:
-                bucket[key] = stamp
+            if not key:
+                continue
+            # **必须无条件刷新时间戳**：只在 key 不存在时写入的话，时间戳永远停在第一次，
+            # 过了保鲜期就永久过期 —— 那批帖子每轮都要重抓正文页，正好撞在贴吧限流上。
+            fresh = key not in bucket
+            bucket[key] = stamp
+            if fresh:
                 added += 1
         return added
 
@@ -732,7 +746,8 @@ def host_key(bucket: str, row: dict[str, Any]) -> str:
 async def _host_keys(db: Any, bucket: str) -> dict[str, Any]:
     """宿主表里现存的行 → {天然键: 行 id}。"""
     model = EXPRESSION_MODEL if bucket == "expressions" else JARGON_MODEL
-    rows = await _db_get(db, model, {}, limit=5000)
+    # 倒序：去重靠读回来的天然键，几十万行的表里窗口必须包含「刚写进去的那几行」
+    rows = await _db_get(db, model, {}, limit=5000, order_by="-id")
     out: dict[str, Any] = {}
     for row in rows:
         key = host_key(bucket, row)
@@ -767,12 +782,19 @@ def _rows_of(result: Any) -> list[dict[str, Any]]:
 
 
 async def _db_get(
-    db: Any, model_name: str, filters: dict[str, Any], *, limit: int | None = None
+    db: Any,
+    model_name: str,
+    filters: dict[str, Any],
+    *,
+    limit: int | None = None,
+    order_by: str | None = None,
 ) -> list[dict[str, Any]]:
     if db is None:
         return []
     try:
-        result = await db.get(model_name=model_name, filters=filters, limit=limit)
+        result = await db.get(
+            model_name=model_name, filters=filters, limit=limit, order_by=order_by
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Galgame/话术] 查询 %s 失败：%s", model_name, exc)
         return []
@@ -825,7 +847,7 @@ async def resolve_session_ids(chat: Any, chat_ids: Sequence[str]) -> dict[str, s
 
 async def _existing_style_keys(db: Any, session_id: str | None) -> set[str]:
     rows = await _db_get(
-        db, EXPRESSION_MODEL, {"session_id": session_id}, limit=2000
+        db, EXPRESSION_MODEL, {"session_id": session_id}, limit=2000, order_by="-id"
     )
     return {style_key(str(r.get("style") or "")) for r in rows}
 
@@ -902,7 +924,7 @@ async def push_phrases(
 
 
 async def _existing_jargon_keys(db: Any) -> set[str]:
-    rows = await _db_get(db, JARGON_MODEL, {}, limit=5000)
+    rows = await _db_get(db, JARGON_MODEL, {}, limit=5000, order_by="-id")
     return {jargon_key(str(r.get("content") or "")) for r in rows}
 
 
@@ -1002,6 +1024,10 @@ async def clear_written(
     if "expressions" in kinds:
         for entry in ledger.expressions:
             row_id = entry.get("id")
+            if row_id is None:
+                # 已经摘过 id（关插件时删掉的行）：宿主表里没有它，别拿 None 去查
+                stats["missing"] += 1
+                continue
             rows = await _db_get(db, EXPRESSION_MODEL, {"id": row_id}, limit=1)
             if not rows:
                 stats["missing"] += 1
@@ -1037,6 +1063,9 @@ async def clear_written(
     if "jargons" in kinds:
         for entry in ledger.jargons:
             row_id = entry.get("id")
+            if row_id is None:
+                stats["missing"] += 1
+                continue
             rows = await _db_get(db, JARGON_MODEL, {"id": row_id}, limit=1)
             if not rows:
                 stats["missing"] += 1
@@ -1147,6 +1176,9 @@ async def retag_expressions(
     stats = {"updated": 0, "kept": 0, "missing": 0, "failed": 0}
     for entry in ledger.expressions:
         row_id = entry.get("id")
+        if row_id is None:
+            stats["missing"] += 1
+            continue
         rows = await _db_get(db, EXPRESSION_MODEL, {"id": row_id}, limit=1)
         if not rows:
             stats["missing"] += 1
@@ -1211,6 +1243,9 @@ async def audit(
 
     alive_styles: list[str] = []
     for entry in ledger.expressions:
+        if entry.get("id") is None:
+            # 花名册里有、当前不在宿主表里（关插件时删过）：stocked 会单独统计
+            continue
         rows = await _db_get(db, EXPRESSION_MODEL, {"id": entry.get("id")}, limit=1)
         if not rows:
             report["expressions"]["missing"] += 1
@@ -1229,6 +1264,8 @@ async def audit(
             report["expressions"]["pending"] += 1
 
     for entry in ledger.jargons:
+        if entry.get("id") is None:
+            continue
         rows = await _db_get(db, JARGON_MODEL, {"id": entry.get("id")}, limit=1)
         if not rows:
             report["jargons"]["missing"] += 1
@@ -1249,8 +1286,20 @@ async def audit(
     report["jargons"]["stocked"] = len(ledger.pending_restore("jargons"))
 
     for group_id, session_id in (sessions or {}).items():
-        visible = await _db_get(db, EXPRESSION_MODEL, dict(_VISIBLE_FILTER, session_id=session_id), limit=1000)
-        pending = await _db_get(db, EXPRESSION_MODEL, {"session_id": session_id, "checked": False}, limit=1000)
+        visible = await _db_get(
+            db,
+            EXPRESSION_MODEL,
+            dict(_VISIBLE_FILTER, session_id=session_id),
+            limit=1000,
+            order_by="-id",
+        )
+        pending = await _db_get(
+            db,
+            EXPRESSION_MODEL,
+            {"session_id": session_id, "checked": False},
+            limit=1000,
+            order_by="-id",
+        )
         report["chats"].append(
             {
                 "group_id": group_id,

@@ -114,7 +114,8 @@ async def cover_data_uri(http: HttpClient | None, url: str) -> str:
         return ""
     mime = _guess_image_mime(raw)
     if len(raw) > COVER_SHRINK_THRESHOLD:
-        shrunk = _shrink_image(raw)
+        # PIL 解码是同步的：并发取 6 张图时会连着阻塞事件循环，挪到线程里
+        shrunk = await asyncio.to_thread(_shrink_image, raw)
         if shrunk is not None:
             raw, mime = shrunk, "image/jpeg"
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
@@ -199,7 +200,7 @@ def _reviews_block(info: GameInfo, accent: str, limit: int = 2) -> str:
     rows = "".join(
         f'<div style="margin:5px 0;font-size:12px;line-height:1.55;color:#4a5361;">'
         f'<span style="color:{accent};font-weight:700;">{r.get("score")} 点</span> '
-        f'{_esc(r.get("text") or "")[:110]}'
+        f'{_esc((r.get("text") or "")[:110])}'
         f'<span style="color:#b3bac6;">'
         f'{"　" + str(r.get("play_hours")) + "h" if r.get("play_hours") else ""}</span></div>'
         for r in reviews
@@ -385,9 +386,11 @@ async def build_recommend_html(
     condition_text: str = "",
 ) -> str:
     """推荐卡：一次列几部，每行带封面缩略图和评分。"""
+    # 封面并发取（同文件其它卡片都走 _fetch_covers）：串行等 10 张 CDN 图会拖到好几秒
+    covers = await _fetch_covers(http, [str(i.cover or "") for i in items])
     rows: list[str] = []
     for idx, info in enumerate(items, 1):
-        cover = await cover_data_uri(http, info.cover)
+        cover = covers[idx - 1] if idx - 1 < len(covers) else ""
         thumb = (
             f'<img src="{cover}" style="width:62px;height:88px;object-fit:cover;'
             f'border-radius:6px;flex:none;" />'
