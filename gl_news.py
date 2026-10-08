@@ -442,11 +442,23 @@ def dedupe_news(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _date_key(value: Any) -> str:
+    """把发布日期补齐成可直接比字符串的定长形式。
+
+    上游有的给到日，有的只给到月。直接比字符串会让月粒度的排在
+    同月的日粒度前面 —— 月粒度其实不知道是那月几号，当成月初最合理。
+    """
+    text = str(value or "").strip()
+    if len(text) == 7 and text[4] == "-":
+        text += "-01"
+    return text
+
+
 def sort_news(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """有日期的按时间倒序在前，没日期的保持原顺序沉底。"""
     dated = [it for it in items if str(it.get("published") or "")]
     undated = [it for it in items if not str(it.get("published") or "")]
-    dated.sort(key=lambda it: str(it.get("published") or ""), reverse=True)
+    dated.sort(key=lambda it: _date_key(it.get("published")), reverse=True)
     return dated + undated
 
 
@@ -463,6 +475,36 @@ def apply_quota(items: list[dict[str, Any]], per_source: int) -> list[dict[str, 
         counts[source] = counts.get(source, 0) + 1
         out.append(item)
     return out
+
+
+def ensure_source_floor(
+    items: list[dict[str, Any]], max_items: int, sources: list[str] | tuple[str, ...]
+) -> list[dict[str, Any]]:
+    """截断到 max_items 之前，先保证每个**抓到了内容**的源至少留一条。
+
+    月幕的中文资讯页面本身不带日期（不是我们没解析出来，是页面就那样），而 sort_news
+    把无日期的条目全部沉底 —— 默认 max_items=12 时 bugbug 和 dgame 各 6 条就把名额占满，
+    整个月幕源会静默消失，用户还以为这个源坏了。
+    """
+    if max_items <= 0 or not items:
+        return list(items)
+    picked = list(items[:max_items])
+    seen = {id(it) for it in picked}
+    present = {str(it.get("source") or "") for it in items}
+    for source in sources:
+        key = str(source or "")
+        if key not in present:
+            continue
+        if any(str(it.get("source") or "") == key for it in picked):
+            continue
+        first = next((it for it in items if str(it.get("source") or "") == key), None)
+        if first is None or id(first) in seen:
+            continue
+        if len(picked) >= max_items:
+            picked.pop()
+        picked.append(first)
+        seen.add(id(first))
+    return picked
 
 
 async def collect_news(
@@ -484,8 +526,11 @@ async def collect_news(
 
     async def one(source: str) -> list[dict[str, Any]]:
         if source == "ymgal":
+            # 不要再给月幕单独抬高缓存下限（原来写的是 max(cache_minutes, 30)）：
+            # 那会让「资讯缓存（分钟）」这个配置对月幕源彻底失效 —— 用户填 0
+            # 也照样缓存半小时，和面板上的 ge=0 以及 README 的说明都对不上。
             return await fetch_ymgal_articles(
-                http, limit=max(per_source, 4), cache_minutes=max(cache_minutes, 30)
+                http, limit=max(per_source, 4), cache_minutes=cache_minutes
             )
         return await fetch_feed(
             http, source, limit=max(per_source, 4), cache_minutes=cache_minutes
@@ -502,7 +547,7 @@ async def collect_news(
 
     items = apply_quota(dedupe_news(items), per_source)
     items = sort_news(items)
-    return items[:max_items], warnings
+    return ensure_source_floor(items, max_items, picked), warnings
 
 
 # --- 翻译（日文标题 → 中文） ----------------------------------------------

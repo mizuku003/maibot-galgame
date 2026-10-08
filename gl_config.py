@@ -251,8 +251,11 @@ class OutputSection(PluginConfigBase):
     )
     accent_color: str = Field(
         default="#c2355f",
+        # 这个值是直接内插进 CSS 的，不卡死格式就等于把 <style> 交给配置面板。
+        # 只收 #RGB / #RRGGBB 两种写法。
+        pattern=r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
         description="资料卡主色调（十六进制）",
-        json_schema_extra={"label": "卡片主色", "hint": "影响标题条与评分条；/gal help 的用法卡固定暖金，不受这里影响"},
+        json_schema_extra={"label": "卡片主色", "hint": "填 #RGB 或 #RRGGBB；用法卡固定暖金，不受这里影响"},
     )
     show_egs_distribution: bool = Field(
         default=False,

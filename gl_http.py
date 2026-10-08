@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 import re
 import time
 from typing import Any
@@ -55,8 +56,11 @@ class _TTLCache:
 
     def set(self, key: str, value: Any, ttl: float) -> None:
         if len(self._data) >= self._max:
-            # 简单淘汰：清掉最早的一批，别做 LRU 了，这点量不值得
-            for k in list(self._data)[: self._max // 4]:
+            # 按「谁先过期」淘汰，而不是按插入顺序：先插进来的恰好是 TTL 最长、
+            # 最该留住的那些（VNDB 详情 1800s、EGS 详情 3600s、封面 86400s），
+            # 按插入顺序清会把它们第一批赶走，等于白缓存。
+            victims = sorted(self._data.items(), key=lambda kv: kv[1][0])[: self._max // 4]
+            for k, _ in victims:
                 self._data.pop(k, None)
         self._data[key] = (time.monotonic() + ttl, value)
 
@@ -75,6 +79,8 @@ class HttpClient:
         self.timeout = timeout
         self.retries = retries
         self.cache = _TTLCache()
+        # 二进制下载的 single-flight 锁（按 URL）：见 fetch_bytes
+        self._byte_locks: dict[str, asyncio.Lock] = {}
         headers = {
             "User-Agent": user_agent or DEFAULT_UA,
             "Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
@@ -104,19 +110,33 @@ class HttpClient:
         """
         if not url:
             return None
-        cached = self.cache.get(f"bytes:{url}")
+        cache_key = f"bytes:{url}"
+        cached = self.cache.get(cache_key)
         if cached is not None:
             return cached
-        try:
-            resp = await self._client.get(url)
-            if resp.status_code >= 400:
-                return None
-            data = resp.content
-            # 图片不会变，缓存久一点
-            self.cache.set(f"bytes:{url}", data, 86400.0)
-            return data
-        except Exception as exc:  # noqa: BLE001
-            raise HttpError(source, f"下载二进制失败：{exc}") from exc
+        # single-flight：一张卡片会并发取 6 张封面，同一部作品的卡又可能被连着
+        # 请求两次。没有这个锁的话，同一张图会被重复下一遍 —— 既慢又容易招限流。
+        # 锁按 URL 分片，不同图之间不互相挡。
+        lock = self._byte_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                resp = await self._client.get(url)
+                if resp.status_code >= 400:
+                    return None
+                data = resp.content
+                # 图片不会变，缓存久一点
+                self.cache.set(cache_key, data, 86400.0)
+                return data
+            except Exception as exc:  # noqa: BLE001
+                raise HttpError(source, f"下载二进制失败：{exc}") from exc
+            finally:
+                # 失败也把锁摘掉：留着的话这张图以后永远走同一个锁对象，
+                # 而它已经不占用了，摘掉才是常态。
+                if not lock.locked():
+                    self._byte_locks.pop(cache_key, None)
 
     async def request(
         self,
@@ -138,7 +158,10 @@ class HttpClient:
             cache_ttl: 大于 0 时启用本进程内缓存。
             expect_json: False 时返回原始文本（批评空间是 HTML）。
         """
-        key = cache_key or f"{method} {url} {json_body} {params}"
+        # headers 也要进键：两套鉴权头打同一个 URL 时不能互相命中（当前调用方都显式传了
+        # cache_key，但那是调用方的纪律，不该由这里默许）。
+        headers_key = tuple(sorted((headers or {}).items()))
+        key = cache_key or f"{method} {url} {json_body} {params} {headers_key}"
         if cache_ttl > 0:
             hit = self.cache.get(key)
             if hit is not None:
@@ -177,11 +200,16 @@ def _retryable(exc: Exception) -> bool:
     """值得重试吗？只有限流（429）、服务端抖动（5xx）和网络异常值得。
 
     400/404 这类是「请求本身有问题」，重试多少次都一样，只会白等退避时间。
+    解析失败（JSON 不是 JSON、字段类型不对）同理 —— 正文没变，重试三次结果一样，
+    只是白白多等 1.8 秒、多打上游两下。
     """
+    if isinstance(exc, (ValueError, json.JSONDecodeError)):
+        return False
     if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
         code = exc.response.status_code
         return code == 429 or code >= 500
-    return True
+    # 空响应（反爬）和宿主网络抖动都算传输层问题，值得再试
+    return isinstance(exc, (httpx.TransportError, httpx.HTTPError))
 
 
 # --- 文本工具（三源共用） -------------------------------------------------
@@ -209,13 +237,26 @@ def normalize_name(text: str) -> str:
         else:
             chars.append(ch)
     out = "".join(chars)
-    # 常见的版本/载体后缀，匹配时应当忽略
-    for noise in [
-        "～", "~", "（", "）", "(", ")", "【", "】", "[", "]",
-        "ohp", "体验版", "体験版", "full voice", "フルボイス",
-        "hd", "remaster", "remastered", "fhd", "完全版", "決定版",
+    # 括号/波浪号这类符号删掉就行，但 hd / fhd / ohp 这些字母缩写必须**按词**
+    # 删：无边界 replace 会把 "HDR" 削成 "r"、"SOHO" 削成 "so"，
+    # 两个本来不相干的标题就被当成同一个了。
+    for symbol in ["～", "~", "（", "）", "(", ")", "【", "】", "[", "]"]:
+        out = out.replace(symbol, "")
+    # 缩写类后缀：右边界必须卡死（不然 "HDR" 会被削成 "r"），左边界反而要放开 ——
+    # 日文标题常把缩写直接粘在词尾（"XXXHD" / "CLANNADHD"），卡左边界就删不掉了。
+    # 顺序有讲究："fhd" 必须排在 "hd" 前面（先删 hd 会把 FHD 削成 "f"），
+    # "remastered" 必须排在 "remaster" 前面。
+    for word in [
+        "ohp", "full voice", "remastered", "remaster", "fhd", "hd",
+        "体验版", "体験版", "完全版", "決定版",
     ]:
-        out = out.replace(noise, "")
+        if word.isascii() and word.isalpha():
+            out = re.sub(rf"{word}(?![a-z])", "", out)
+        else:
+            out = out.replace(word, "")
+            # 「Remaster版」这种后面还挂个汉字的写法：缩写删掉后剩个孤零零的「版」
+            if word in ("体验版", "体験版", "完全版", "決定版"):
+                out = out.replace("版", "")
     for sep in [" ", "\t", "　", "-", "_", "：", ":", "・", "/", "!", "！", "?", "？", "「", "」"]:
         out = out.replace(sep, "")
     return out.strip()

@@ -347,6 +347,7 @@ class TiebaClient:
             kwargs["proxy"] = proxy
         self._client = httpx.AsyncClient(**kwargs)
         self._seeded = False
+        self._last_html: str = ""      # _get 成功时把这一页的 HTML 留在这里，_get_html 直接取
         self._seeded_ok = False      # 播种是否真的成功过：失败时的 403 = 缺 cookie，不是反爬
         self._seed_lock = asyncio.Lock()
 
@@ -382,14 +383,19 @@ class TiebaClient:
             if self._seeded:
                 return
             try:
-                await self._client.get(
+                # 首页也可能回 403 / 验证页：那种情况不算「拿到 cookie」，
+                # 后面的 403 会被当成缺 cookie 重新播种一次，而不是直接判反爬。
+                home = await self._client.get(
                     BAIDU_HOME, headers={"User-Agent": MOBILE_UA, "Accept": "text/html,*/*"}
                 )
-                self._seeded_ok = True
+                self._seeded_ok = not _looks_blocked(home.status_code, home.text)
             except Exception as exc:  # noqa: BLE001
                 # 播种失败也放行：有些网络环境下百度首页不可达但 tieba 本身可达
                 logger.debug("[Galgame/贴吧] 访客 cookie 播种失败（继续尝试）：%s", exc)
+            # 播种也是一次真实请求，照样要占一个请求间隔
+            await self._sleep()
             self._seeded = True
+            return self._seeded_ok
 
     async def _get(
         self,
@@ -397,11 +403,11 @@ class TiebaClient:
         *,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
-    ) -> str | None:
-        """取一页 HTML。失败返回 None（调用方决定是重试还是放弃）。
+    ) -> bool | None:
+        """取一页并确认它是正常内容。成功返回 True，失败返回 None。
 
-        唯独反爬拦截会抛 TiebaBlockedError —— 那是「暂时不给我看」，
-        重试只会把封禁加深，必须让整轮抓取立刻停下来。
+        调用方不用再自己判断「拿到了没有」：拦截、403、空响应、解析不出来的页面一律
+        返回 None，免得把验证页当成正文解析出一堆垃圾。
         """
         left = self._blocked_remaining()
         if left > 0:
@@ -415,13 +421,13 @@ class TiebaClient:
         for attempt in range(self.retries + 1):
             try:
                 resp = await self._client.get(url, params=params, headers=merged)
-                # 访客 cookie 没拿到时贴吧对**任意**页面都回 403（它自己的 docstring 就这么写）。
-                # 这跟反爬拦截是两回事：先重新播种一次再重试，别直接判成封禁把整轮停掉。
-                if resp.status_code == 403 and not self._seeded_ok and not reseeded:
+                # 没播种成功时的 403 是「缺访客 cookie」，不是反爬拦截：
+                # 重新播种一次再重试，别直接判封禁把整轮停掉。
+                if not self._seeded_ok and not reseeded:
                     reseeded = True
                     self._seeded = False
                     await self._seed_guest_cookie()
-                    raise httpx.HTTPError("HTTP 403（缺访客 cookie，已重新播种）")
+                    raise httpx.HTTPError("访客 cookie 没拿到，已重新播种")
                 if _looks_blocked(resp.status_code, resp.text):
                     self._mark_blocked()
                     logger.warning(
@@ -432,20 +438,34 @@ class TiebaClient:
                         BLOCK_COOLDOWN_SECONDS,
                     )
                     raise TiebaBlockedError("贴吧返回「百度安全验证」，已停止本轮抓取")
-                if resp.status_code >= 400:
-                    raise httpx.HTTPError(f"HTTP {resp.status_code}")
                 text = resp.text
+                self._last_html = text
                 if not text.strip():
                     raise httpx.HTTPError("空响应")
-                return text
+                return True
             except TiebaBlockedError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                if attempt < self.retries:
-                    await asyncio.sleep(0.8 * (attempt + 1))
-        logger.warning("[Galgame/贴吧] 请求失败 %s：%s", url, last)
+            # 不管还有没有下一次尝试，先歇一个间隔 —— 失败路径完全不歇最容易招来限流
+            await self._sleep()
         return None
+
+    async def _get_html(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> str | None:
+        '''
+        取一页并返回 HTML 文本（前提是这一页确实是正常内容）。
+
+        失败返回 None，交由调用方决定怎么办。
+        '''
+        if not await self._get(url, params=params, headers=headers):
+            return None
+        return self._last_html
 
     # -- 列表 ---------------------------------------------------------------
 
@@ -463,13 +483,12 @@ class TiebaClient:
         seen: set[str] = set()
         for page in range(max(1, int(pages))):
             offset = page * LIST_PAGE_STEP
-            raw = await self._get(
+            raw = await self._get_html(
                 f"{TIEBA_ORIGIN}{LIST_PATH}",
                 params={"kw": forum, "pn": offset},
                 headers={"User-Agent": MOBILE_UA},
             )
-            await self._sleep()
-            if raw is None:
+            if not raw:
                 # 单页失败就跳过去继续翻，别把「没取到」当成「没有更多」
                 # （EGS 索引那次就是这么静默截断到 300 条的）
                 continue
@@ -510,16 +529,13 @@ class TiebaClient:
         headers = {"User-Agent": MOBILE_UA}
         if referer:
             headers["Referer"] = referer
-        raw = await self._get(
+        # 老式 kz=（帖子 id）参数才会给服务端渲染的正文；
+        # 换成 tid= 会拿到 /p/ 那套空壳。pn 对 kz= 无效，只出首页。
+        raw = await self._get_html(
             f"{TIEBA_ORIGIN}{LIST_PATH}",
-            # 老式 kz=（帖子 id）参数才会给服务端渲染的正文；
-            # 换成 tid= 会拿到 /p/ 那套空壳。pn 对 kz= 无效，只出首页。
             params={"kz": thread.tid, "pn": 1},
             headers=headers,
         )
-        await self._sleep()
-        if raw is None:
-            return []
         posts = parse_posts(
             raw,
             max_posts=max_posts,

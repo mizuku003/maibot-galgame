@@ -131,6 +131,7 @@
 | `review.max_chars` | `/锐评` 的篇幅上限，默认 300 |
 | `review.model_task` | `/锐评` 用哪个模型任务，默认 `replyer`（回复模型）；可以填宿主的其它任务（`planner` / `utils`…），留空则用宿主默认任务 `utils` |
 | `output.send_card` | 是否发送资料卡图片 |
+| `output.accent_color` | 资料卡主色，只能填 `#RGB` 或 `#RRGGBB`（它直接进 CSS，所以格式不对会被配置校验挡下）。用法卡固定暖金，不受这里影响 |
 | `recommend.min_vndb_rating` | 默认 VNDB 评分下限，仅在用户未提供评分条件时生效 |
 | `style.enabled` / `auto_learn` / `interval_hours` | 贴吧话术的总开关、是否自动学习、间隔小时（前两个默认关） |
 | `style.inject_expressions` / `inject_jargons` | 是否让麦麦用学到的表达方式 / 黑话（默认关）。关掉的那一类会从麦麦表里撤出来（语料留档），重新打开自动写回；也决定学习那一轮写哪一类 |
@@ -152,7 +153,7 @@
 | `news.summary_chars` | 列表摘要的截断字数，0 表示不截断 |
 | `news.detail_full` | 看详情时是否再跑一趟原文页抓整篇正文，默认开 |
 | `news.detail_chars` | 详情正文最多保留多少字，0 表示不限制 |
-| `news.cache_minutes` | 抓取结果的缓存分钟数，只在本次运行内有效 |
+| `news.cache_minutes` | 抓取结果的缓存分钟数（填 0 表示不缓存），只在本次运行内有效；对月幕源同样生效 |
 
 ### 锐评提示词
 

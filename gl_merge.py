@@ -506,6 +506,12 @@ class GalgameService:
             except Exception:  # noqa: BLE001
                 scanned_items = []
         if degraded_egs and not scanned_items:
+            # 走到这里说明「用户要的是批评空间分，实际拿的是 VNDB 分」——口径不同却
+            # 完全静默，用户根本不知道这个 85 是 VNDB 的 85。必须留一条警告。
+            self.last_warnings.append(
+                "没能读到批评空间的中央值（本地索引不可用、榜单也扫不到），"
+                "这次按 VNDB 分近似筛选 —— 两者口径不同，分数线只能当参考。"
+            )
             min_rating = max(min_rating, min_egs)
             if max_egs > 0:
                 max_rating = max_egs if max_rating <= 0 else min(max_rating, max_egs)

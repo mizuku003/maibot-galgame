@@ -104,10 +104,22 @@ class EgsIndex:
         """
         if not self.path.exists() and not self._install_seed():
             return False
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001 —— 索引坏了就当没有，重建即可
-            return False
+        data = self._read_index()
+        if data is None:
+            # 索引文件坏了（多半是上次写到一半断电/被 kill）。以前这里直接 return False，
+            # 于是坏文件一直躺在磁盘上：每次启动都失败，内置的整份索引再也铺不上，
+            # 用户只能吃一次几百页的全量重爬。删掉坏文件、重铺种子才是该做的事。
+            logger.warning("[EGS] 本地索引读不出来（文件损坏？），删掉重铺内置索引")
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError as exc:  # noqa: BLE001
+                logger.warning("[EGS] 坏索引删不掉：%s", exc)
+                return False
+            if not self._install_seed():
+                return False
+            data = self._read_index()
+            if data is None:
+                return False
         if int(data.get("version") or 0) != INDEX_VERSION:
             return False
         self.items = list(data.get("items") or [])
@@ -115,6 +127,14 @@ class EgsIndex:
         self.min_votes = int(data.get("min_votes") or 0)
         self._build_lookup()
         return bool(self.items)
+
+    def _read_index(self) -> dict[str, Any] | None:
+        """读索引文件；解析/IO 出问题都返回 None，由调用方决定怎么补救。"""
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[EGS] 索引解析失败：%s", exc)
+            return None
 
     def _install_seed(self) -> bool:
         """把内置种子解压到数据目录；失败就当没有（退回联网构建）。"""
@@ -143,7 +163,12 @@ class EgsIndex:
             "count": len(self.items),
             "items": self.items,
         }
-        self.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # 原子写：先写同目录临时文件再 replace。
+        # 直接 write_text 的话，索引一万九千条、几 MB，中途断电/被杀就是半个 JSON，
+        # 下次启动就解析失败 —— 上面那段「坏了重铺」正是要兜这个场面，别自己制造它。
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.path)
 
     def merge(self, incoming: list[dict[str, Any]]) -> dict[str, int]:
         """把一批新抓的条目并进索引：同 id 覆盖（分数会变），新 id 追加。
@@ -1072,17 +1097,30 @@ class EgsClient:
           形如「シナリオがいい(137)」——这才是"大家觉得它好在哪"。
         """
         out: dict[str, Any] = {"attributes": [], "tags": [], "genre": "", "pov": {}}
+        # id 的引号不能写死：HTML 允许 id=att_pov_table 不带引号，写死引号会让
+        # 整张属性表静默解析不出来（标签、POV 维度一起消失，而且不报错）。
         table = re.search(
-            r'<table[^>]*id="att_pov_table"[^>]*>(.*?)</table>', raw_html, flags=re.S | re.I
+            r'<table[^>]*\bid\s*=\s*["\']?att_pov_table["\']?[^>]*>(.*?)</table>',
+            raw_html,
+            flags=re.S | re.I,
         )
         if not table:
             return out
         for row in re.findall(r"<tr[^>]*>(.*?)</tr>", table.group(1), flags=re.S | re.I):
-            head = re.search(r"<th[^>]*>(.*?)</th>", row, flags=re.S | re.I)
+            cells = re.findall(r"<t([hd])[^>]*>(.*?)</t\1>", row, flags=re.S | re.I)
             body = re.search(r"<td[^>]*>(.*?)</td>", row, flags=re.S | re.I)
-            if not head or not body:
+            if not body:
                 continue
-            label = _flatten(head.group(1)).strip()
+            head_text = next((text for tag, text in cells if tag.lower() == "h"), "")
+            if not head_text:
+                # 缺 <th> 的行原来是直接 continue 的：整行静默消失。
+                # 这里退一步，用这一行的**第一格**当分类名（EGS 的表确实有这种行），
+                # 退不了再丢 —— 静默丢数据比猜错标签更糟。
+                first = re.search(r"<td[^>]*>(.*?)</td>", row, flags=re.S | re.I)
+                head_text = first.group(1) if first else ""
+                if not head_text:
+                    continue
+            label = _flatten(head_text).strip()
             cell = body.group(1)
 
             if label == "公式ジャンル":
@@ -1140,8 +1178,16 @@ class EgsClient:
             )
             body = block.split("<br />", 1)
             body_text = body[1] if len(body) > 1 else ""
-            # 正文到「→ 長文感想」或 play_time 为止
-            body_text = re.split(r"→|<div", body_text)[0]
+            # 正文到「→ 長文感想」或 play_time 为止。
+            # 入口链接的**锚文本**（長文感想(185)(ネタバレ注意)）就挂在正文尾巴上，
+            # 按标签切会把这段说明文字留进短评正文里 —— 用户看到的短评会莫名其妙
+            # 以「長文感想(185)(ネタバレ注意)」结尾。所以先按 <a …> 锚文本整段切掉。
+            body_text = re.sub(
+                r'<a\b[^>]*>\s*長文感想\(\d+\)(?:\(ネタバレ注意\))?\s*</a>',
+                "",
+                body_text,
+            )
+            body_text = re.split(r"→|<div|<a\b", body_text)[0]
             body_text = _flatten(body_text).strip()
             if not body_text or len(body_text) < 4:
                 continue
@@ -1179,10 +1225,29 @@ class EgsClient:
         chunk = text[start : start + 1200]
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        # 形如「100 519」「90～99 455」「0～9 0」，中间可能夹着「状況 度数 グラフ」表头
+        # 形如「100 519」「90～99 455」「0～9 0」，中间可能夹着「状況 度数 グラフ」表头。
+        # 得点刻度只可能是 0~100 的十位档，所以档位值必须落在这个范围内；
+        # 否则会捞到表格外紧跟着的数字对（「集計 2024 03 12」会被读成 03 档 12 票），
+        # 把总分算大、好评率算歪。碰到第一个非法档位就认为表格结束。
         for match in re.finditer(r"(?:^|\s)(\d{1,3})(?:～(\d{1,3}))?\s+(\d{1,6})(?=\s|$)", chunk):
-            low = match.group(1)
-            high = match.group(2) or low
+            # 档位只可能是 0/10/20/…/100 或「X0～Y9」这种十位刻度，写法上是一位到三位数字。
+            # 「集計 2024 03 12」里的 03 会被 int() 变成合法的 3 分档，光看数值拦不住，
+            # 必须连原始写法一起校验（前导零不是刻度该有的写法）。
+            raw_low, raw_high = match.group(1), match.group(2)
+            if raw_low.startswith("0") and raw_low != "0":
+                if out:
+                    break
+                continue
+            low = int(raw_low)
+            high = int(raw_high) if raw_high else low
+            if not (0 <= low <= 100 and 0 <= high <= 100 and low <= high):
+                if out:
+                    break
+                continue
+            if not (low % 10 == 0 and (high == low or high % 10 == 9)):
+                if out:
+                    break
+                continue
             label = f"{high}" if not match.group(2) else f"{low}～{high}"
             if label in seen:
                 continue

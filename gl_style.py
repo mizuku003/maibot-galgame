@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -79,6 +80,40 @@ _THREAD_TTL_DAYS = 30
 # --- 文本清洗 --------------------------------------------------------------
 
 
+# 零宽字符：从网页复制来的话术里很常见，肉眼看不见却会让去重指纹对不上
+
+# （同一条黑话会被判成新的、重复写进宿主表），孤立代理项还会在写库时直接炸。
+
+_ZW_CHARS = (
+
+    "\u200b"  # zero width space
+
+    "\u200c"  # zero width non-joiner
+
+    "\u200d"  # zero width joiner
+
+    "\ufeff"  # zero width no-break space / BOM
+
+)
+
+
+
+
+
+def _strip_zw(value: str) -> str:
+
+    """去掉零宽字符（肉眼看不见，却会让去重把同一条判成两条）。"""
+
+    if not any(ch in value for ch in _ZW_CHARS):
+
+        return value
+
+    return "".join(ch for ch in value if ch not in _ZW_CHARS)
+
+
+
+
+
 def _clean_text(value: Any, limit: int) -> str:
     """把模型给的一小段文本收拾干净：去空白、去引号、压成一整句。
 
@@ -86,7 +121,7 @@ def _clean_text(value: Any, limit: int) -> str:
     """
     if not isinstance(value, str):
         return ""
-    text = value.strip().strip("\"'“”「」『』")
+    text = _strip_zw(value).strip().strip("\"'“”「」『』")
     text = re.sub(r"\s+", " ", text).strip()
     if not text or len(text) > max(1, int(limit)):
         return ""
@@ -95,7 +130,7 @@ def _clean_text(value: Any, limit: int) -> str:
 
 def normalize_style(style: str) -> str:
     """跟宿主 normalize_expression_style_for_learning 对齐：去掉开头的「使用」。"""
-    text = (style or "").strip()
+    text = _strip_zw(style or "").strip()
     if text.startswith("使用"):
         text = text[2:].strip()
     return re.sub(r"\s+", "", text)
@@ -107,7 +142,7 @@ def style_key(style: str) -> str:
 
 
 def jargon_key(content: str) -> str:
-    return re.sub(r"\s+", "", (content or "")).casefold()
+    return re.sub(r"\s+", "", _strip_zw(content or "")).casefold()
 
 
 # --- 吧名标签 --------------------------------------------------------------
@@ -466,7 +501,11 @@ class StyleLedger:
         self._data["updated_at"] = datetime.now().isoformat(timespec="seconds")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
+            # 临时名带上线程/进程标识：清理、开关同步、学习可能在不同线程里同时
+
+            # 存花名册，共用一个 tmp 名会互相覆盖，最后 replace 的那份把另一份顶掉。
+
+            tmp = self.path.with_name(f"{self.path.name}.{threading.get_ident()}.tmp")
             tmp.write_text(
                 json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -504,7 +543,12 @@ class StyleLedger:
         row_id = row.get("id")
         key = entry_key(bucket, row)
         for index, exist in enumerate(items):
-            if entry_key(bucket, exist) == key or (row_id is not None and exist.get("id") == row_id):
+            if key and entry_key(bucket, exist) == key:
+                items[index] = row
+                return
+            # 只在**两边都带 id** 时认 id：留档条目（id 已摘掉）不该靠
+            # 「id 都是 None」这种巧合对上，否则整批留档会被一条条顶掉。
+            if row_id is not None and exist.get("id") == row_id:
                 items[index] = row
                 return
         items.append(row)
@@ -559,6 +603,32 @@ class StyleLedger:
             return
         items = self._data.get(bucket) or []
         self._data[bucket] = [x for x in items if x.get("id") != row_id]
+
+    def drop_stock(self, bucket: str) -> int:
+
+        """把「留着语料、当前不在宿主表里」的条目整批丢掉。
+
+
+
+        /gal 话术 清理 用：那条命令的承诺是「删干净」，包括花名册里的语料；
+
+        留档不清的话，下一次 /gal 话术 刷新（或自动轮次）会把刚删掉的行原样写回。
+
+        只动不带 id 的条目 —— 带着 id 的那些由 clear_written 处理。
+
+        """
+
+        items = self._data.get(bucket) or []
+
+        keep = [x for x in items if x.get("id")]
+
+        dropped = len(items) - len(keep)
+
+        self._data[bucket] = keep
+
+        return dropped
+
+
 
     def unlink(self, bucket: str, row_id: Any) -> bool:
         """行已从宿主表里删掉，但语料留着 —— 只摘掉 id，不丢记录。"""
@@ -733,12 +803,18 @@ def _revive_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def host_key(bucket: str, row: dict[str, Any]) -> str:
     """宿主表里认一行用的天然键。
 
-    和 entry_key 的区别：宿主表**没有 forum 这一列**（吧名只写在 situation 里），
-    所以对照宿主行时只能拿 (风格, 会话) 或内容来认。
+    宿主表**没有 forum 这一列**（吧名只写在 situation 里），所以表达方式只能靠
+    (风格, 会话, 吧名) 来认：少了吧名这一步，同一个群学两个吧、风格又刚好一样的
+    两行就会算成同一条 —— restore_written 会把两条留档认到同一个 id 上，其中一行
+    永远回不了表（带上同一个 id 之后，清理还会删错行）。
     """
     if bucket == "expressions":
         return "|".join(
-            [style_key(str(row.get("style") or "")), str(row.get("session_id") or "")]
+            [
+                style_key(str(row.get("style") or "")),
+                str(row.get("session_id") or ""),
+                forum_label(split_forum_tag(str(row.get("situation") or ""))[1]),
+            ]
         )
     return jargon_key(str(row.get("content") or ""))
 
@@ -923,9 +999,19 @@ async def push_phrases(
     return stats
 
 
-async def _existing_jargon_keys(db: Any) -> set[str]:
-    rows = await _db_get(db, JARGON_MODEL, {}, limit=5000, order_by="-id")
-    return {jargon_key(str(r.get("content") or "")) for r in rows}
+async def _jargon_exists(db: Any, content: str) -> bool:
+    """这条黑话在宿主表里已经有了吗？
+
+    以前是把整表按 id 倒序拉 5000 行做内存去重。jargons 是麦麦自己一直在学的
+    增长表，超过窗口之后老行看不见，插件就会把同一条黑话再插一遍 —— WebUI 里
+    出现两行、计数被拆散，而且插件只记得后一行，清理时前一行永久残留。
+    改成按 content 精确查：黑话条数本来不多，多这一次查询换「绝不重复写」。
+    """
+    key = jargon_key(content)
+    if not key:
+        return True
+    rows = await _db_get(db, JARGON_MODEL, {"content": content}, limit=1)
+    return bool(rows)
 
 
 async def push_jargons(
@@ -952,14 +1038,14 @@ async def push_jargons(
     target_ids = [sid for sid in (session_ids or []) if sid]
     session_dict = json.dumps({sid: 1 for sid in target_ids}, ensure_ascii=False)
     is_global = not target_ids
-    existing = await _existing_jargon_keys(db)
     for jargon in jargons:
-        key = jargon_key(jargon.content)
-        if not key or key in existing:
+        if not jargon_key(jargon.content):
+            stats["skipped"] += 1
+            continue
+        if await _jargon_exists(db, jargon.content):
             stats["skipped"] += 1
             continue
         if dry_run:
-            existing.add(key)
             stats["created"] += 1
             continue
         data = {
@@ -985,7 +1071,6 @@ async def push_jargons(
             logger.warning("[Galgame/话术] 写黑话没有返回 id：%s", jargon.content)
             stats["failed"] += 1
             continue
-        existing.add(key)
         ledger.add_jargon(
             row_id=row[0]["id"],
             content=jargon.content,

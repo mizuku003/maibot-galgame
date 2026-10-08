@@ -1119,11 +1119,15 @@ class GalgamePlugin(MaiBotPlugin):
                     width=int(self.config.output.card_width),
                     condition_text=condition,
                 )
-                await self._render_and_send(html, stream_id)
+                if not await self._render_and_send(html, stream_id):
+                    # 工具路径还有 content 交给模型兜底，所以不在这里退回文本卡，
+                    # 但至少要留下痕迹 —— 别让「用户一张图都没收到」变成静默事件。
+                    self.ctx.logger.warning("[Galgame] 推荐卡没渲染出图片（工具路径，交给模型回文字）")
             except Exception as exc:  # noqa: BLE001
                 self.ctx.logger.warning("[Galgame] 推荐卡片渲染失败：%s", exc)
         elif self.config.output.send_card and stream_id and len(picks) == 1:
-            await self._send_info_card(picks[0], stream_id)
+            if not await self._send_info_card(picks[0], stream_id):
+                self.ctx.logger.warning("[Galgame] 资料卡没渲染出图片（工具路径，交给模型回文字）")
 
         lines = build_search_lines(picks)
         # 顺便把条件里最相关的几部的评分信息带上，省得模型再问一轮
@@ -1704,9 +1708,11 @@ class GalgamePlugin(MaiBotPlugin):
         """
         nodes = _split_review_nodes(text)
         if len(text) >= 80 and nodes:
+            # 昵称只取一次：以前写在列表推导里，每条 node 都 await 一遍
+            nickname = await _bot_nickname(self.ctx)
             messages = [
                 {
-                    "nickname": await _bot_nickname(self.ctx),
+                    "nickname": nickname,
                     "segments": [{"type": "text", "content": piece}],
                 }
                 for piece in nodes
@@ -2859,6 +2865,13 @@ class GalgamePlugin(MaiBotPlugin):
             return
         kinds = self._style_inject_kinds()
         off = tuple(b for b in ("expressions", "jargons") if b not in kinds)
+        # 必须和「学习/同步」互斥：撤出与写回都是「读花名册 → 改宿主表 → 存花名册」，
+        # 交叉跑会出现「刚撤掉的行又被学习循环写回去」，用户看到的开关就失灵了。
+        # 学习循环已经持锁时不能干等 —— 它可能正在抓贴吧，等下去等于把配置更新卡死。
+        lock = getattr(self, "_style_learn_lock", None)
+        if lock is not None and lock.locked():
+            self.ctx.logger.info("[Galgame] 话术学习正在跑，开关同步挪到下一轮")
+            return
         try:
             if off:
                 stats = await gl_style.clear_written(db, ledger, kinds=off, keep=True)
@@ -3272,10 +3285,15 @@ class GalgamePlugin(MaiBotPlugin):
             await self.ctx.send.text("话术模块没准备好。", stream_id, storage_message=False)
             return False, "话术模块未就绪", 1
         stats = await gl_style.clear_written(db, ledger)
+        # 留档也必须清：留着的话下一次 /gal 话术 刷新（或自动轮次）会把刚删掉的行
+        # 原样写回宿主表 —— 用户看到的「删干净了」就被悄悄推翻了。
+        dropped = sum(ledger.drop_stock(b) for b in ("expressions", "jargons"))
+        await asyncio.to_thread(ledger.save)
         await self.ctx.send.text(
-            f"【贴吧话术 · 清理】删掉 {stats['deleted']} 行（表达方式 + 黑话），花名册里的语料也一并清掉。"
-            f"\n本来就不在了 {stats['missing']} 行 · 你改过的（保留）{stats['changed']} 行"
-            f" · 删失败 {stats['failed']} 行。",
+            f"【贴吧话术 · 清理】删掉 {stats["deleted"]} 行（表达方式 + 黑话），"
+            f"花名册里的语料也一并清掉（{dropped} 条留档）。"
+            f"\n本来就不在了 {stats["missing"]} 行 · 你改过的（保留）{stats["changed"]} 行"
+            f" · 删失败 {stats["failed"]} 行。",
             stream_id,
             storage_message=False,
         )
@@ -3298,6 +3316,13 @@ class GalgamePlugin(MaiBotPlugin):
         db = getattr(self.ctx, "db", None)
         ledger = self._style_ledger
         if db is None or ledger is None:
+            return
+        # 卸载路径不能等锁：学习循环可能正在抓贴吧（几十秒起步），
+        # 等下去会让 on_unload 超时。拿不到锁就跳过 —— 关插件的清理只是
+        # 顺手做的事，下次 /gal 话术 清理 还能补上。
+        lock = getattr(self, "_style_learn_lock", None)
+        if lock is not None and lock.locked():
+            self.ctx.logger.info("[Galgame/话术] 话术学习正在跑，关闭时的清理跳过")
             return
         try:
             stats = await gl_style.clear_written(db, ledger, keep=True)
