@@ -874,7 +874,7 @@ class GalgamePlugin(MaiBotPlugin):
         # 上游哪天去掉兜底，整个工具描述就没了。
         description=(
             "查 galgame 资料与检索。三种用法："
-            "① query=作品名（中日英/外号都认）→ 完整资料+资料卡；"
+            "① query=作品名（中日英/外号都认）→ 完整资料（评分/时长/标签/评价）；"
             "② 只给筛选条件 → 找作品，评分口径二选一：min/max_rating 是 VNDB 分、"
             "min/max_egs 是批评空间中央值（不可换算，别混用）；"
             "③ new_within_days=N → 最近 N 天新作（独立模式，忽略其它条件）。"
@@ -956,6 +956,14 @@ class GalgamePlugin(MaiBotPlugin):
                 "type": "integer",
                 "description": "查最近 N 天新作（独立模式，设了就忽略其它条件），0=不查。没说天数时填 30，最多 50",
             },
+            "send_card": {
+                "type": "boolean",
+                "description": (
+                    "要不要把结果做成图片发到群里，默认 false。"
+                    "只在聊天里顺口问一句就别发图；"
+                    "用户明显想要卡片、图片时再传 true。需要插件配置里打开「允许工具出图」，否则这个参数不起作用"
+                ),
+            },
         },
     )
     async def handle_search(
@@ -975,6 +983,7 @@ class GalgamePlugin(MaiBotPlugin):
         count: int = 0,
         with_characters: bool = False,
         new_within_days: int = 0,
+        send_card: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         stream_id = str(kwargs.get("stream_id") or "")
@@ -1043,7 +1052,7 @@ class GalgamePlugin(MaiBotPlugin):
             # 走月幕的发售日历，和「按年份筛」不是一回事 —— 后者是 VNDB 的 released 过滤，
             # 只认罗马音标题、也不知道有没有汉化。
             if new_within_days:
-                return await self._tool_new_releases(stream_id, new_within_days, count)
+                return await self._tool_new_releases(stream_id, new_within_days, count, send_card)
 
             # 用法①：纯名字 → 查资料
             if query and not has_filter:
@@ -1055,7 +1064,7 @@ class GalgamePlugin(MaiBotPlugin):
                     if with_characters or _CHARACTER_HINT.search(query):
                         info.characters = await self._service.characters_for(info)
                     summary = self._info_summary(info)
-                    if self.config.output.send_card and stream_id:
+                    if stream_id and self._tool_send_card(send_card):
                         await self._send_info_card(info, stream_id)
                     return {"success": True, "content": self._summary_text(info), "game": summary}
                 # 名字对不上具体作品 → 退化成候选列表，让模型自己决定要不要追问
@@ -1110,7 +1119,7 @@ class GalgamePlugin(MaiBotPlugin):
             query, min_egs, max_egs, min_rating, max_rating,
             votes_floor, min_hours, max_hours, tags, year_from, offset,
         ) + widen_note
-        if self.config.output.send_card and stream_id and len(picks) > 1:
+        if stream_id and len(picks) > 1 and self._tool_send_card(send_card):
             try:
                 html = await build_recommend_html(
                     picks,
@@ -1125,7 +1134,7 @@ class GalgamePlugin(MaiBotPlugin):
                     self.ctx.logger.warning("[Galgame] 推荐卡没渲染出图片（工具路径，交给模型回文字）")
             except Exception as exc:  # noqa: BLE001
                 self.ctx.logger.warning("[Galgame] 推荐卡片渲染失败：%s", exc)
-        elif self.config.output.send_card and stream_id and len(picks) == 1:
+        elif stream_id and len(picks) == 1 and self._tool_send_card(send_card):
             if not await self._send_info_card(picks[0], stream_id):
                 self.ctx.logger.warning("[Galgame] 资料卡没渲染出图片（工具路径，交给模型回文字）")
 
@@ -1184,7 +1193,7 @@ class GalgamePlugin(MaiBotPlugin):
             "问「最近已经出了什么新作」应该改用 gal_search 的 new_within_days；"
             "mode=detail 配 index 看某一条的详情（序号来自上一次列出的那屏）。"
             "列出的条数会记下来，用户随后问「第 3 条是什么」就用 mode=detail、index=3。"
-            "结果已经发过卡片，你只要用一两句话概括重点，不要一条条复述。"
+            "拿到结果后用一两句话概括重点，不要一条条复述。"
         ),
         # 和 gal_search 一样刻意声明 deferred：没被发现时只占 system-reminder 一行。
         visibility="deferred",
@@ -1205,6 +1214,14 @@ class GalgamePlugin(MaiBotPlugin):
                 "type": "integer",
                 "description": "mode=detail 时要看的序号（1 开始，来自上一次列出的那屏）",
             },
+            "send_card": {
+                "type": "boolean",
+                "description": (
+                    "要不要把结果做成图片发到群里，默认 false。"
+                    "只在聊天里顺口问一句就别发图；"
+                    "用户明显想要卡片、图片时再传 true。需要插件配置里打开「允许工具出图」，否则这个参数不起作用"
+                ),
+            },
         },
     )
     async def handle_news(
@@ -1213,6 +1230,7 @@ class GalgamePlugin(MaiBotPlugin):
         limit: int = 0,
         days: int = 0,
         index: int = 0,
+        send_card: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         stream_id = str(kwargs.get("stream_id") or "")
@@ -1221,7 +1239,7 @@ class GalgamePlugin(MaiBotPlugin):
         want = str(mode or "news").strip().lower()
         # 看详情不依赖最新情报开关（记的东西可能来自 /gal new，那个关了也能用）
         if want in ("detail", "详情", "查看", "展开"):
-            return await self._tool_detail(stream_id, index)
+            return await self._tool_detail(stream_id, index, send_card)
         news = getattr(self.config, "news", None)
         if news is None or not news.enabled:
             return {
@@ -1229,12 +1247,12 @@ class GalgamePlugin(MaiBotPlugin):
                 "content": "最新情报没启用（插件配置里的「最新情报」段），查不了新闻和预定。",
             }
         if want in ("upcoming", "预定", "即将发售", "发售"):
-            return await self._tool_upcoming(stream_id, limit, days)
+            return await self._tool_upcoming(stream_id, limit, days, send_card)
         # 其余（news / 新闻 / 资讯 / intel）一律**只给新闻** —— 和 /gal 情报 对齐。
         # 以前 mode=intel（默认）会把新闻和即将发售拼一屏，用户分不清哪条命令给什么。
-        return await self._tool_news(stream_id, limit)
+        return await self._tool_news(stream_id, limit, send_card)
 
-    async def _tool_detail(self, stream_id: str, index: int) -> dict[str, Any]:
+    async def _tool_detail(self, stream_id: str, index: int, send_card: bool = False) -> dict[str, Any]:
         """看上一次列出的第 N 条的详情（和 /gal 详情 <序号> 共用一份记忆）。"""
         try:
             number = int(str(index).strip())
@@ -1250,7 +1268,7 @@ class GalgamePlugin(MaiBotPlugin):
                 "先查一次情报/预定列出来，再按编号问详情。",
             }
         detail = await self._detail_item(item)
-        if stream_id:
+        if stream_id and self._tool_send_card(send_card):
             await self._send_detail_card(
                 stream_id,
                 detail,
@@ -1267,7 +1285,7 @@ class GalgamePlugin(MaiBotPlugin):
             "results": [result],
         }
 
-    async def _tool_news(self, stream_id: str, limit: int) -> dict[str, Any]:
+    async def _tool_news(self, stream_id: str, limit: int, send_card: bool = False) -> dict[str, Any]:
         news = self.config.news
         want = int(limit) or int(news.max_items)
         try:
@@ -1285,7 +1303,7 @@ class GalgamePlugin(MaiBotPlugin):
         lines = self._with_notes(self._news_lines(picks), warnings)
         lines.append(self._detail_hint())
         self._remember_intel(stream_id, picks)
-        if stream_id:
+        if stream_id and self._tool_send_card(send_card):
             await self._send_news_card(
                 stream_id,
                 picks,
@@ -1300,7 +1318,7 @@ class GalgamePlugin(MaiBotPlugin):
             "results": [self._news_result(item) for item in picks],
         }
 
-    async def _tool_upcoming(self, stream_id: str, limit: int, days: int) -> dict[str, Any]:
+    async def _tool_upcoming(self, stream_id: str, limit: int, days: int, send_card: bool = False) -> dict[str, Any]:
         news = self.config.news
         want = int(limit) or max(int(news.max_items), 10)
         try:
@@ -1323,7 +1341,7 @@ class GalgamePlugin(MaiBotPlugin):
         lines = self._with_notes(self._new_release_lines(picks), warnings)
         lines.append(self._detail_hint())
         self._remember_intel(stream_id, picks)
-        if stream_id:
+        if stream_id and self._tool_send_card(send_card):
             await self._send_release_card(
                 stream_id,
                 picks,
@@ -2316,7 +2334,9 @@ class GalgamePlugin(MaiBotPlugin):
             storage_message=False,
         )
 
-    async def _tool_new_releases(self, stream_id: str, days: int, count: int) -> dict[str, Any]:
+    async def _tool_new_releases(
+        self, stream_id: str, days: int, count: int, send_card: bool = False
+    ) -> dict[str, Any]:
         """「最近有什么新 gal 发售」的自然语言入口 —— **只答已发售的那一段**。
 
         和 :meth:`_cmd_new` 共用查询与呈现，区别只在于这个把结果**回给模型**
@@ -2344,7 +2364,7 @@ class GalgamePlugin(MaiBotPlugin):
         subtitle = f"已发售 {start} ~ {end} 共 {len(items)} 部"
         if len(items) > len(shown):
             subtitle += f"，这里列出前 {len(shown)} 部"
-        if stream_id:
+        if stream_id and self._tool_send_card(send_card):
             await self._send_release_card(
                 stream_id,
                 shown,
@@ -3562,6 +3582,30 @@ class GalgamePlugin(MaiBotPlugin):
             "简介": (info.intro or "")[:300],
             "数据来源": info.sources,
         }
+
+    def _tool_send_card(self, flag: bool = False) -> bool:
+        """工具路径要不要把卡片发到群里。
+
+        工具调用是模型自己的动作：群里没人要图，它却在聊天中间糊一张卡片，
+        是最扎眼的一种「机器人感」。所以这里默认一律不发 —— 文字资料本来
+        就已经在返回值的 content 里给模型了，卡片只是锦上添花。
+
+        想把这个决定权交回模型，就打开配置里的「允许工具出图」；
+        这时模型传 send_card=true 才出图。
+
+        send_card 参数**始终**写在工具的参数表里（参数表是类定义时定死的，
+        而面板保存配置不会重收组件），开不开只看这里现读的配置值，
+        所以面板改完立刻生效，不需要重载插件。
+        指令路径不受这里影响：用户自己敲的 /gal，该出图就出图。
+        """
+        try:
+            if not self.config.output.send_card:
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        if bool(getattr(self.config.output, "tool_card_param", False)):
+            return bool(flag)
+        return False
 
     async def _send_info_card(self, info: GameInfo, stream_id: str) -> bool:
         """发资料卡，返回**图片是否真的发出去了**。

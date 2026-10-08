@@ -272,6 +272,14 @@ class OutputSection(PluginConfigBase):
         description="资料卡上隐藏成人向评价维度",
         json_schema_extra={"label": "隐藏成人向评价维度", "hint": "只影响卡片，给模型的数据不变"},
     )
+    tool_card_param: bool = Field(
+        default=False,
+        description="工具调用时要不要允许出图",
+        json_schema_extra={
+            "label": "允许工具出图",
+            "hint": "关：工具只回文字资料，卡片只由指令发；开：模型可以传 send_card=true 出图",
+        },
+    )
 
 
 # /锐评 的提示词模板，可以在配置面板里整段改。

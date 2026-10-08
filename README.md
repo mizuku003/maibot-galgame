@@ -130,7 +130,13 @@
 | `review.prompt` | `/锐评` 的完整提示词，可在配置面板里整段改（见下方说明） |
 | `review.max_chars` | `/锐评` 的篇幅上限，默认 300 |
 | `review.model_task` | `/锐评` 用哪个模型任务，默认 `replyer`（回复模型）；可以填宿主的其它任务（`planner` / `utils`…），留空则用宿主默认任务 `utils` |
-| `output.send_card` | 是否发送资料卡图片 |
+| `output.send_card` | 是否发送资料卡图片（默认开）；关掉后 `/gal` 只回文本 |
+| `output.card_width` | 资料卡渲染宽度（默认 830，范围 480~1200）。用法卡共用这个宽度 |
+| `output.max_tags` | 资料卡上最多显示几个标签（默认 12，范围 3~30） |
+| `output.show_egs_distribution` | 资料卡上是否画批评空间的得点分布柱状图（默认关） |
+| `output.show_reviews` | 资料卡上是否放两条批评空间短评（默认开） |
+| `output.hide_adult_pov` | 资料卡上隐藏成人向评价维度（默认开）。只影响卡片，给模型的数据不变 |
+| `output.tool_card_param` | **允许工具出图**（默认关）：关着时模型调用工具只拿到文字资料，卡片只由指令发；打开后模型可以传 `send_card=true` 让工具出图。改完立即生效，不用重载 |
 | `output.accent_color` | 资料卡主色，只能填 `#RGB` 或 `#RRGGBB`（它直接进 CSS，所以格式不对会被配置校验挡下）。用法卡固定暖金，不受这里影响 |
 | `recommend.min_vndb_rating` | 默认 VNDB 评分下限，仅在用户未提供评分条件时生效 |
 | `style.enabled` / `auto_learn` / `interval_hours` | 贴吧话术的总开关、是否自动学习、间隔小时（前两个默认关） |
