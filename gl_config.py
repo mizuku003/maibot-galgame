@@ -288,7 +288,7 @@ DEFAULT_REVIEW_PROMPT = (
     "「中盘开始日常变得又长又平」比「节奏一般」有用得多；\n"
     "5. 【长文感想】是别的玩家的原话，可以顺着他们的观点说，"
     "但别整句照抄，也别复述标了剧透的剧情；\n"
-    "6. 口语优先：可以用「说实话」「讲真」这种词，但**不要**出现"
+    "6. 别出现"
     "「总的来说」「综上所述」「值得一提」「无论是…还是…」「堪称」「不得不说」"
     "「作为一款…」「本作」这类书面语，也不要自称 AI、不要提「资料显示」；\n"
     "7. 全篇 {max_chars} 字以内。可以分成 2~4 段短话"
@@ -314,7 +314,15 @@ class ReviewSection(PluginConfigBase):
     persona: str = Field(
         default="懂 galgame 的老玩家",
         description="锐评的口吻 / 人设",
-        json_schema_extra={"label": "锐评口吻", "hint": "填进提示词的 {persona} 占位符"},
+        json_schema_extra={"label": "锐评口吻", "hint": "填进提示词的 {persona}"},
+    )
+    follow_bot: bool = Field(
+        default=False,
+        description="锐评沿用机器人自己的人设",
+        json_schema_extra={
+            "label": "沿用麦麦人设",
+            "hint": "开：{persona} 换成麦麦的「人格设定」；关：用上面的「锐评口吻」（默认关）",
+        },
     )
     prompt: str = Field(
         default=DEFAULT_REVIEW_PROMPT,
@@ -332,12 +340,15 @@ class ReviewSection(PluginConfigBase):
         ge=80,
         le=1200,
         description="锐评的篇幅上限（字）",
-        json_schema_extra={"label": "锐评篇幅（字）", "hint": "太长就不像在群里聊天了"},
+        json_schema_extra={"label": "锐评篇幅（字）"},
     )
     model_task: str = Field(
-        default="",
-        description="用哪个模型任务来写锐评（留空 = 宿主的默认任务）",
-        json_schema_extra={"label": "模型任务（留空 = 默认）"},
+        default="replyer",
+        description="用哪个模型任务来写锐评（默认 replyer = 回复模型）",
+        json_schema_extra={
+            "label": "模型任务",
+            "hint": "默认 replyer（回复模型）；可填宿主其它任务名，留空用宿主默认任务 utils",
+        },
     )
 
 

@@ -114,6 +114,7 @@ _REVIEW_MAX_NODES = 6
 # 读不到宿主昵称时的兜底发言人，就是插件自己的显示名
 _BOT_NICKNAME_FALLBACK = "galgame领域大神"
 _bot_nickname_cache: str | None = None
+_bot_persona_cache: str | None = None
 
 # 详情正文翻译一次喂多少字：gl_news.translate_text 默认只吃 900 字，
 # 整篇丢进去会被静默截断（后半段留日文）。这里自己切块，一块一调。
@@ -139,6 +140,27 @@ async def _bot_nickname(ctx) -> str:
         return _BOT_NICKNAME_FALLBACK
     _bot_nickname_cache = name
     return name
+
+
+async def _bot_persona(ctx) -> str:
+    """宿主「人格设定」（personality.personality），给锐评当口吻用。
+
+    和昵称一样走配置能力读，不自己拼宿主路径；人格是多行文本，压成一行再
+    塞进提示词，省得把模板撑开。读不到返回空串，调用方继续用插件自己的
+    「锐评口吻」；读失败不写缓存，下次还能再试。
+    """
+    global _bot_persona_cache
+    if _bot_persona_cache is not None:
+        return _bot_persona_cache
+    try:
+        raw = await ctx.config.get("personality.personality", "")
+    except Exception:  # noqa: BLE001 —— 读不到就用自己的口吻
+        return ""
+    text = " ".join(str(raw or "").split())
+    if not text:
+        return ""
+    _bot_persona_cache = text
+    return text
 
 
 async def _host_bot_name(ctx) -> str:
@@ -661,8 +683,9 @@ class GalgamePlugin(MaiBotPlugin):
         await self._close_http()
         # 配置一改，上一屏的序号记忆可能指向旧数据源；机器人昵称也要重新读一次
         self._intel_cache.clear()
-        global _bot_nickname_cache
+        global _bot_nickname_cache, _bot_persona_cache
         _bot_nickname_cache = None
+        _bot_persona_cache = None
         self._setup()
         self._maybe_build_index()
         self._style_ledger = gl_style.StyleLedger(self._data_dir() / "style_ledger.json")
@@ -1523,7 +1546,7 @@ class GalgamePlugin(MaiBotPlugin):
             )
             return True, "有候选", 1
 
-        text = await self._generate_review(self._build_review_prompt(self._build_review_material(info)))
+        text = await self._generate_review(await self._build_review_prompt(self._build_review_material(info)))
         if not text:
             await self.ctx.send.text(
                 "锐评生成失败（模型没返回内容），稍后再试一次。", stream_id, storage_message=False
@@ -1618,42 +1641,56 @@ class GalgamePlugin(MaiBotPlugin):
             + ["", "=== 核对用的数字（正文里别罗列它们，最多带一句总分） ===", *lines]
         )
 
-    def _build_review_prompt(self, material: str) -> str:
+    async def _build_review_prompt(self, material: str) -> str:
         """锐评的 prompt，模板来自配置面板的「锐评提示词」。
 
         提示词整段都可以被用户改，所以这里只做占位符替换 + 兜底
         （见 ``_render_review_prompt``）。默认模板里的约束 —— 不许编造、别分点、
         别用「总的来说 / 作为一款」这类 AI 腔 —— 都在 ``gl_config.DEFAULT_REVIEW_PROMPT``。
+
+        打开「沿用麦麦人设」时，{persona} 换成宿主的「人格设定」，锐评就跟麦麦
+        平时说话一个腔调；读不到才退回插件自己的「锐评口吻」。
         """
         cfg = self.config
+        persona = str(cfg.review.persona or "")
+        if bool(getattr(cfg.review, "follow_bot", False)):
+            host_persona = await _bot_persona(self.ctx)
+            if host_persona:
+                persona = host_persona
         template = str(getattr(cfg.review, "prompt", "") or "").strip() or DEFAULT_REVIEW_PROMPT
         return _render_review_prompt(
             template,
-            persona=str(cfg.review.persona or ""),
+            persona=persona,
             max_chars=int(cfg.review.max_chars),
             material=material,
         )
 
     async def _generate_review(self, prompt: str) -> str:
-        """调宿主的 LLM 生成锐评；失败返回空串，由调用方告诉用户。"""
+        """调宿主的 LLM 生成锐评；失败返回空串，由调用方告诉用户。
+
+        用哪个模型只看面板的「模型任务」（默认 replyer = 回复模型）；填了就听它的，
+        留空则用宿主的默认任务。调不动时自动退回宿主的默认任务，不至于写不出来。
+        """
         cfg = self.config
         max_tokens = max(256, min(2048, int(cfg.review.max_chars) * 3))
-        try:
-            result = await self.ctx.llm.generate(
-                prompt=prompt,
-                model=str(cfg.review.model_task or ""),
-                temperature=0.85,
-                max_tokens=max_tokens,
-                timeout_ms=_LLM_RPC_TIMEOUT_MS,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.warning("[Galgame] /锐评 调用模型失败：%s", exc)
-            return ""
-        if not isinstance(result, dict) or not result.get("success"):
+        model = str(cfg.review.model_task or "").strip()
+        for route in ([model, ""] if model else [""]):
+            try:
+                result = await self.ctx.llm.generate(
+                    prompt=prompt,
+                    model=route,
+                    temperature=0.85,
+                    max_tokens=max_tokens,
+                    timeout_ms=_LLM_RPC_TIMEOUT_MS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("[Galgame] /锐评 调用模型失败（%s）：%s", route or "默认任务", exc)
+                continue
+            if isinstance(result, dict) and result.get("success"):
+                return _clean_review_output(str(result.get("response") or ""))
             detail = result.get("error") if isinstance(result, dict) else result
-            self.ctx.logger.warning("[Galgame] /锐评 模型返回失败：%s", detail)
-            return ""
-        return _clean_review_output(str(result.get("response") or ""))
+            self.ctx.logger.warning("[Galgame] /锐评 模型返回失败（%s）：%s", route or "默认任务", detail)
+        return ""
 
     async def _send_review_forward(self, stream_id: str, text: str) -> None:
         """把锐评包成一条「聊天记录」（合并转发）发出去。
